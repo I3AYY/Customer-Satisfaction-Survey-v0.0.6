@@ -1,0 +1,620 @@
+<script>
+  /**
+   * ============================================================================
+   * ส่วนควบคุมลอจิกแอปพลิเคชันฝั่งหน้าบ้าน (Client-side Javascript Controller)
+   * เวอร์ชัน: 0.0.6 AI Core (Multi-Role Support & Luminous UX Update - Fixed Race Condition)
+   * กลุ่มงานพยาธิวิทยาคลินิกและเทคนิคการแพทย์ โรงพยาบาลมะเร็งสุราษฎร์ธานี
+   * ============================================================================
+   */
+
+  // 1. ตัวแปรเก็บสถานะหลักของระบบ (Core Application State)
+  let appState = {
+    questions: [],
+    answers: [],
+    logoUrl: '',
+    qrUrl: '',
+    availableYears: [],
+    currentYear: '',
+    activeView: 'survey',
+    currentRole: 'Patient' // ค่าเริ่มต้นเป็น ผู้ป่วย/ญาติ
+  };
+
+  const AUTO_RESET_TIMEOUT = 3000;
+
+  // ตัวแปรแปลงชื่อ Role เป็นภาษาไทย
+  const ROLE_NAMES_TH = {
+    'Patient': 'ผู้ป่วย/ญาติ',
+    'Doctor': 'แพทย์',
+    'Nurse': 'พยาบาล',
+    'NA': 'ผู้ช่วยเหลือคนไข้'
+  };
+
+  // 2. เมื่อหน้าเว็บโหลดเสร็จ
+  document.addEventListener('DOMContentLoaded', () => {
+    appState.answers = new Array(5).fill(''); // จองพื้นที่ Array คำตอบ
+    setupEventListeners();
+    fetchInitialData(appState.currentRole);
+  });
+
+  /**
+   * ผูก Event Listener
+   */
+  function setupEventListeners() {
+    const btnToggleView = document.getElementById('btnToggleView');
+    const btnSubmitSurvey = document.getElementById('btnSubmitSurvey');
+    const yearFilter = document.getElementById('yearFilter');
+    const btnRefreshStats = document.getElementById('btnRefreshStats');
+    const roleBtns = document.querySelectorAll('.role-selector-btn');
+
+    if (btnToggleView) btnToggleView.addEventListener('click', toggleView);
+    if (btnSubmitSurvey) btnSubmitSurvey.addEventListener('click', confirmSubmission);
+    
+    if (yearFilter) {
+      yearFilter.addEventListener('change', (e) => {
+        loadDashboardStats(e.target.value);
+      });
+    }
+
+    if (btnRefreshStats) {
+      btnRefreshStats.addEventListener('click', () => {
+        const icon = btnRefreshStats.querySelector('i');
+        icon.classList.add('fa-spin');
+        loadDashboardStats(yearFilter.value).then(() => {
+          setTimeout(() => icon.classList.remove('fa-spin'), 500);
+        });
+      });
+    }
+
+    // Event Listener สำหรับปุ่มเปลี่ยนประเภทผู้รับบริการ (Role Selection)
+    roleBtns.forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const target = e.currentTarget;
+        const selectedRole = target.dataset.role;
+
+        // ถ้ากดปุ่มเดิม ไม่ต้องทำอะไร
+        if (appState.currentRole === selectedRole) return;
+
+        // 1. เปลี่ยนสไตล์ปุ่มให้เป็นสถานะ Active
+        roleBtns.forEach(b => {
+          b.classList.remove('active', 'bg-gradient-to-r', 'from-medical-deepBlue', 'to-blue-600', 'text-white', 'shadow-md');
+          b.classList.add('text-slate-500', 'hover:text-medical-deepBlue', 'hover:bg-blue-50');
+        });
+        target.classList.remove('text-slate-500', 'hover:text-medical-deepBlue', 'hover:bg-blue-50');
+        target.classList.add('active', 'bg-gradient-to-r', 'from-medical-deepBlue', 'to-blue-600', 'text-white', 'shadow-md');
+
+        // 2. อัปเดต State และเปลี่ยนมุมมอง
+        appState.currentRole = selectedRole;
+        handleChangeRole(selectedRole);
+      });
+    });
+  }
+
+  /**
+   * ฟังก์ชันจัดการเมื่อมีการเปลี่ยนประเภทผู้รับบริการ
+   */
+  function handleChangeRole(role) {
+    if (appState.activeView === 'dashboard') {
+      // กรณีอยู่หน้า Dashboard: แสดง Loading เฉพาะตารางสถิติ
+      const grid = document.getElementById('dashboardStatsGrid');
+      if (grid) grid.innerHTML = `<div class="w-full py-10 flex justify-center text-blue-500"><i class="fa-solid fa-circle-notch fa-spin text-4xl"></i></div>`;
+      
+      const commentsContainer = document.getElementById('commentsContainer');
+      if (commentsContainer) commentsContainer.innerHTML = '<div class="text-center text-slate-400 text-sm py-4">กำลังโหลดข้อเสนอแนะ...</div>';
+    } else {
+      // กรณีอยู่หน้า Survey: ซ่อนเนื้อหาและแสดง Skeleton Loader ชั่วคราว
+      const questionsGrid = document.getElementById('questionsGrid');
+      if (questionsGrid) questionsGrid.classList.add('hidden');
+      
+      const surveyFooter = document.getElementById('surveyFooter');
+      if (surveyFooter) surveyFooter.classList.add('hidden');
+      
+      const skeletonLoader = document.getElementById('skeletonLoader');
+      if (skeletonLoader) skeletonLoader.classList.remove('hidden');
+    }
+    
+    // เคลียร์คำตอบเดิม และข้อเสนอแนะ
+    appState.answers = []; 
+    const staffComment = document.getElementById('staffComment');
+    if (staffComment) staffComment.value = '';
+
+    // สลับกล่องแสดงข้อเสนอแนะ (QR Code สำหรับผู้ป่วย, Textarea สำหรับบุคลากร)
+    const qrContainer = document.getElementById('qrCodeContainer');
+    const textContainer = document.getElementById('textCommentContainer');
+    const dashCommentTitle = document.getElementById('dashCommentTitle');
+    const dashRoleTitle = document.getElementById('dashRoleTitle');
+    
+    if (role === 'Patient') {
+      if (qrContainer) {
+        qrContainer.classList.remove('hidden');
+        qrContainer.classList.add('flex');
+      }
+      if (textContainer) textContainer.classList.add('hidden');
+      if (dashCommentTitle) dashCommentTitle.innerHTML = 'ข้อเสนอแนะจากผู้รับบริการ (สแกน QR)';
+    } else {
+      if (qrContainer) {
+        qrContainer.classList.add('hidden');
+        qrContainer.classList.remove('flex');
+      }
+      if (textContainer) textContainer.classList.remove('hidden');
+      if (dashCommentTitle) dashCommentTitle.innerHTML = 'ข้อเสนอแนะจากผู้รับบริการ';
+    }
+    
+    if (dashRoleTitle) dashRoleTitle.textContent = `(${ROLE_NAMES_TH[role]})`;
+
+    // เรียกดึงข้อมูลใหม่ (โดยการดึงข้อมูล Dashboard จะรอดึงหลังจากที่ได้คำถามมาครบก่อน เพื่อป้องกันบั๊กแสดงรายข้อผิด)
+    fetchInitialData(role);
+  }
+
+  /**
+   * โหลดข้อมูลเริ่มต้น (คำถาม, โลโก้, QR, ปี) ตาม Role
+   */
+  function fetchInitialData(role) {
+    google.script.run
+      .withSuccessHandler(onInitialDataSuccess)
+      .withFailureHandler(onInitialDataFailure)
+      .getInitialData(role);
+  }
+
+  function onInitialDataSuccess(data) {
+    appState.questions = data.questions;
+    appState.logoUrl = data.logoUrl;
+    appState.qrUrl = data.qrUrl;
+    appState.availableYears = data.availableYears;
+    appState.currentYear = data.currentYear;
+    
+    // เตรียม Array สำหรับคำตอบให้พอดีกับจำนวนคำถาม
+    appState.answers = new Array(appState.questions.length).fill('');
+
+    // อัปเดตรูปภาพต่างๆ
+    if (appState.logoUrl) document.getElementById('appLogo').src = appState.logoUrl;
+    if (appState.qrUrl) document.getElementById('qrCodeImg').src = appState.qrUrl;
+
+    // อัปเดตตัวกรองปี
+    const yearFilter = document.getElementById('yearFilter');
+    if (yearFilter) {
+      // เก็บค่าปีที่เลือกไว้ปัจจุบัน (ถ้ามี)
+      const currentSelection = yearFilter.value;
+      yearFilter.innerHTML = '<option value="ทั้งหมด">ทั้งหมด</option>';
+      appState.availableYears.forEach(year => {
+        const option = document.createElement('option');
+        option.value = year;
+        option.textContent = year;
+        yearFilter.appendChild(option);
+      });
+      // คืนค่าที่เลือกไว้ ถ้ามีในลิสต์
+      if (appState.availableYears.includes(currentSelection)) {
+        yearFilter.value = currentSelection;
+      }
+    }
+
+    renderQuestionsGrid();
+
+    // ซ่อน Loader แสดงเนื้อหา
+    const skeletonLoader = document.getElementById('skeletonLoader');
+    if (skeletonLoader) skeletonLoader.classList.add('hidden');
+    
+    if (appState.activeView === 'survey') {
+      const questionsGrid = document.getElementById('questionsGrid');
+      if (questionsGrid) questionsGrid.classList.remove('hidden');
+      
+      // ฟอร์ซการแสดง Footer
+      const footer = document.getElementById('surveyFooter');
+      if (footer) {
+        footer.classList.remove('hidden');
+        footer.classList.add('flex');
+      }
+    } else if (appState.activeView === 'dashboard') {
+      // ถ้าเปิดหน้า Dashboard อยู่ ให้รออัปเดตสถิติหลังจากที่ได้โครงสร้างคำถามใหม่แล้ว
+      const selectedYear = yearFilter ? yearFilter.value : 'ทั้งหมด';
+      loadDashboardStats(selectedYear);
+    }
+    
+    checkCompletion();
+  }
+
+  function onInitialDataFailure(error) {
+    const skeletonLoader = document.getElementById('skeletonLoader');
+    if (skeletonLoader) skeletonLoader.classList.add('hidden');
+    
+    Swal.fire({
+      icon: 'error',
+      title: 'ไม่สามารถโหลดข้อมูลได้',
+      text: 'กรุณาตรวจสอบการเชื่อมต่ออินเทอร์เน็ต: ' + error.message,
+      confirmButtonColor: '#1E3A8A'
+    });
+  }
+
+  /**
+   * วาดการ์ดคำถามลงหน้าจอ (ปรับใช้ Flexbox ให้เรียงเข้ากลาง)
+   */
+  function renderQuestionsGrid() {
+    const grid = document.getElementById('questionsGrid');
+    
+    // เปลี่ยน Class จาก Grid ปกติเป็น Flex Wrap เพื่อให้ไพ่กระจายตัวตรงกลางกรณีมีน้อยกว่า 5 ข้อ
+    const isHidden = grid.classList.contains('hidden');
+    grid.className = `flex flex-wrap justify-center gap-4 md:gap-6 w-full ${isHidden ? 'hidden' : ''}`;
+    
+    grid.innerHTML = '';
+
+    if (appState.questions.length === 0) {
+      grid.innerHTML = '<div class="w-full text-center text-slate-500 py-10 bg-white/50 rounded-[2rem] border border-blue-100">ยังไม่มีการตั้งคำถามในระบบ หรือยังไม่มีข้อมูลสำหรับกลุ่มเป้าหมายนี้</div>';
+      return;
+    }
+
+    appState.questions.forEach((q, index) => {
+      const card = document.createElement('div');
+      card.id = `card-q-${index}`;
+      
+      // กำหนดขนาดการ์ดตาม Breakpoint: มือถือเต็มจอ(หักgap), แท็บเล็ต 2 ใบ, คอมพิวเตอร์ 5 ใบ
+      card.className = 'w-full sm:w-[calc(50%-0.5rem)] md:w-[calc(50%-0.75rem)] lg:w-[calc(20%-1.2rem)] max-w-[320px] flex-shrink-0 bg-white/90 backdrop-blur-md border border-blue-100/80 rounded-[2rem] shadow-[0_8px_30px_rgb(30,58,138,0.06)] overflow-hidden flex flex-col transition-all duration-300 hover:-translate-y-1 hover:shadow-[0_15px_35px_rgba(30,58,138,0.12)] relative group card-question';
+      
+      const imgSection = `
+        <div class="relative h-32 sm:h-40 w-full bg-blue-50 overflow-hidden border-b border-blue-50">
+          <img src="${q.imageUrl}" alt="Question ${q.id}" class="w-full h-full object-cover transition-transform duration-700 group-hover:scale-110" onerror="this.src='https://placehold.co/800x500/F0F9FF/1E3A8A?text=Question+${q.id}'">
+          <div class="absolute top-3 left-3 bg-white/90 backdrop-blur-md text-medical-deepBlue w-8 h-8 flex items-center justify-center rounded-full font-bold shadow-md text-sm border border-blue-100">
+            ${q.id}
+          </div>
+        </div>
+      `;
+
+      const textSection = `
+        <div class="p-4 flex-grow flex items-center justify-center text-center">
+          <h3 class="font-bold text-medical-deepBlue text-sm md:text-base leading-snug line-clamp-3">${q.text}</h3>
+        </div>
+      `;
+
+      const btnGroup = document.createElement('div');
+      btnGroup.className = 'flex border-t border-blue-50 bg-slate-50/50 mt-auto';
+      
+      // ปุ่มพอใจ (สถานะเริ่มต้น: สีเขียวอ่อนแบบจางๆ opacity-60)
+      const btnSatisfied = document.createElement('button');
+      btnSatisfied.className = 'flex-1 py-3.5 flex flex-col items-center gap-1 transition-all duration-300 bg-emerald-50/50 text-emerald-500 opacity-60 hover:opacity-100 hover:bg-emerald-100 btn-satisfied';
+      btnSatisfied.innerHTML = `<i class="fa-regular fa-face-smile-beam text-2xl"></i><span class="text-xs font-bold font-heading">พอใจ</span>`;
+      btnSatisfied.onclick = () => selectAnswer(index, 'พอใจ', card);
+
+      // ปุ่มไม่พอใจ (สถานะเริ่มต้น: สีแดงอ่อนแบบจางๆ opacity-60)
+      const btnDissatisfied = document.createElement('button');
+      btnDissatisfied.className = 'flex-1 py-3.5 flex flex-col items-center gap-1 border-l border-blue-50 transition-all duration-300 bg-rose-50/50 text-rose-500 opacity-60 hover:opacity-100 hover:bg-rose-100 btn-dissatisfied';
+      btnDissatisfied.innerHTML = `<i class="fa-regular fa-face-frown text-2xl"></i><span class="text-xs font-bold font-heading">ไม่พอใจ</span>`;
+      btnDissatisfied.onclick = () => selectAnswer(index, 'ไม่พอใจ', card);
+
+      btnGroup.appendChild(btnSatisfied);
+      btnGroup.appendChild(btnDissatisfied);
+
+      card.innerHTML = imgSection + textSection;
+      card.appendChild(btnGroup);
+      grid.appendChild(card);
+    });
+
+    checkCompletion();
+  }
+
+  /**
+   * จัดการเมื่อเลือกคำตอบ (Glow Effect & Opacity Reset)
+   */
+  function selectAnswer(qIndex, answer, cardElement) {
+    appState.answers[qIndex] = answer;
+
+    const btnSat = cardElement.querySelector('.btn-satisfied');
+    const btnDis = cardElement.querySelector('.btn-dissatisfied');
+
+    // Reset styles กลับไปเป็นแบบจางๆ ก่อน
+    btnSat.className = 'flex-1 py-3.5 flex flex-col items-center gap-1 transition-all duration-300 bg-emerald-50/50 text-emerald-500 opacity-60 hover:opacity-100 hover:bg-emerald-100 btn-satisfied';
+    btnSat.innerHTML = `<i class="fa-regular fa-face-smile-beam text-2xl"></i><span class="text-xs font-bold font-heading">พอใจ</span>`;
+    
+    btnDis.className = 'flex-1 py-3.5 flex flex-col items-center gap-1 border-l border-blue-50 transition-all duration-300 bg-rose-50/50 text-rose-500 opacity-60 hover:opacity-100 hover:bg-rose-100 btn-dissatisfied';
+    btnDis.innerHTML = `<i class="fa-regular fa-face-frown text-2xl"></i><span class="text-xs font-bold font-heading">ไม่พอใจ</span>`;
+
+    // Active styles based on MedTech Theme (ลบ Opacity ทิ้งเพื่อให้สีสดทึบ 100%)
+    if (answer === 'พอใจ') {
+      btnSat.className = 'flex-1 py-3.5 flex flex-col items-center gap-1 transition-all duration-300 bg-medical-pastelGreen text-white opacity-100 btn-satisfied transform scale-[1.02] shadow-inner rounded-bl-[2rem] shadow-[0_0_15px_rgba(16,185,129,0.3)] z-10';
+      btnSat.innerHTML = `<i class="fa-solid fa-face-smile-beam text-2xl animate-bounce"></i><span class="text-xs font-bold font-heading drop-shadow-sm">พอใจ</span>`;
+      cardElement.style.borderColor = '#10B981';
+      cardElement.style.boxShadow = '0 0 25px rgba(16, 185, 129, 0.15)';
+    } else if (answer === 'ไม่พอใจ') {
+      btnDis.className = 'flex-1 py-3.5 flex flex-col items-center gap-1 transition-all duration-300 bg-medical-crimson text-white opacity-100 btn-dissatisfied transform scale-[1.02] shadow-inner rounded-br-[2rem] shadow-[0_0_15px_rgba(159,18,57,0.3)] z-10';
+      btnDis.innerHTML = `<i class="fa-solid fa-face-frown text-2xl animate-bounce"></i><span class="text-xs font-bold font-heading drop-shadow-sm">ไม่พอใจ</span>`;
+      cardElement.style.borderColor = '#9F1239';
+      cardElement.style.boxShadow = '0 0 25px rgba(159, 18, 57, 0.15)';
+    }
+
+    checkCompletion();
+  }
+
+  function checkCompletion() {
+    const btnSubmit = document.getElementById('btnSubmitSurvey');
+    let answeredCount = 0;
+    appState.questions.forEach((q, idx) => {
+      if (appState.answers[idx] !== '') answeredCount++;
+    });
+
+    if (answeredCount === appState.questions.length && appState.questions.length > 0) {
+      btnSubmit.disabled = false;
+      btnSubmit.classList.add('animate-pulse');
+      // เน้น Glow รอบปุ่มให้ชัดขึ้นเมื่อพร้อมกด
+      btnSubmit.classList.replace('shadow-[0_0_20px_rgba(30,58,138,0.3)]', 'shadow-[0_0_30px_rgba(30,58,138,0.6)]');
+    } else {
+      btnSubmit.disabled = true;
+      btnSubmit.classList.remove('animate-pulse');
+      btnSubmit.classList.replace('shadow-[0_0_30px_rgba(30,58,138,0.6)]', 'shadow-[0_0_20px_rgba(30,58,138,0.3)]');
+    }
+  }
+
+  /**
+   * ยืนยันการส่งแบบประเมิน (SweetAlert MedTech Theme)
+   */
+  function confirmSubmission() {
+    Swal.fire({
+      title: 'ยืนยันการส่งแบบประเมิน?',
+      text: "กรุณาตรวจสอบความถูกต้องก่อนกดส่งคำตอบ",
+      icon: 'question',
+      showCancelButton: true,
+      confirmButtonColor: '#1E3A8A', // Deep Blue
+      cancelButtonColor: '#9F1239',  // Crimson Red
+      confirmButtonText: '<i class="fa-solid fa-paper-plane mr-2"></i> ส่งคำตอบ',
+      cancelButtonText: '<i class="fa-solid fa-pen mr-2"></i> กลับไปแก้ไข',
+      customClass: {
+        popup: 'rounded-[2rem] shadow-2xl border border-white/80',
+        title: 'font-heading text-medical-deepBlue font-extrabold',
+      }
+    }).then((result) => {
+      if (result.isConfirmed) submitData();
+    });
+  }
+
+  function submitData() {
+    Swal.fire({
+      title: 'กำลังส่งข้อมูล...',
+      html: 'กรุณารอสักครู่ ระบบกำลังบันทึกความคิดเห็นของท่าน',
+      allowOutsideClick: false,
+      didOpen: () => Swal.showLoading()
+    });
+
+    // ดึงข้อเสนอแนะ (เฉพาะในกรณีที่ไม่ใช่โหมดผู้ป่วย)
+    let userComment = '';
+    if (appState.currentRole !== 'Patient') {
+      const commentBox = document.getElementById('staffComment');
+      if (commentBox) userComment = commentBox.value;
+    }
+
+    // สร้าง Payload แบบ Object เพื่อให้รองรับ Multi-Role
+    const payload = {
+      role: appState.currentRole,
+      answers: appState.answers,
+      comment: userComment
+    };
+
+    google.script.run
+      .withSuccessHandler((response) => {
+        if (response.success) {
+          Swal.fire({
+            icon: 'success',
+            title: 'ขอบพระคุณเป็นอย่างสูง',
+            html: 'เราจะนำความคิดเห็นของท่าน<br>ไปพัฒนาบริการให้ดียิ่งขึ้น',
+            showConfirmButton: false,
+            timer: AUTO_RESET_TIMEOUT,
+            timerProgressBar: true,
+            allowOutsideClick: false,
+            customClass: {
+              popup: 'rounded-[2rem] shadow-2xl border border-white/80',
+              title: 'font-heading text-medical-deepBlue font-extrabold',
+            }
+          }).then(() => resetSurvey());
+        }
+      })
+      .withFailureHandler((error) => {
+        Swal.fire({
+          icon: 'error',
+          title: 'เกิดข้อผิดพลาด',
+          text: error.message,
+          confirmButtonColor: '#1E3A8A'
+        });
+      })
+      .submitSurveyResponse(payload);
+  }
+
+  function resetSurvey() {
+    // ล้างคำตอบ และข้อเสนอแนะ
+    appState.answers = new Array(appState.questions.length).fill('');
+    const commentBox = document.getElementById('staffComment');
+    if (commentBox) commentBox.value = '';
+
+    renderQuestionsGrid(); 
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  /**
+   * สลับมุมมอง Survey <-> Dashboard
+   */
+  function toggleView() {
+    const surveyView = document.getElementById('surveyViewContainer');
+    const dashView = document.getElementById('dashboardViewContainer');
+    const toggleIcon = document.getElementById('toggleIcon');
+    const toggleText = document.getElementById('toggleText');
+
+    if (appState.activeView === 'survey') {
+      appState.activeView = 'dashboard';
+      surveyView.classList.add('hidden');
+      dashView.classList.remove('hidden');
+      
+      toggleIcon.className = 'fa-solid fa-clipboard-check text-blue-200';
+      toggleText.textContent = 'กลับไปทำแบบประเมิน';
+      
+      const yearFilter = document.getElementById('yearFilter');
+      loadDashboardStats(yearFilter ? yearFilter.value : 'ทั้งหมด');
+    } else {
+      appState.activeView = 'survey';
+      dashView.classList.add('hidden');
+      surveyView.classList.remove('hidden');
+      
+      toggleIcon.className = 'fa-solid fa-chart-pie text-blue-200';
+      toggleText.textContent = 'ดูสถิติ (Dashboard)';
+    }
+  }
+
+  /**
+   * โหลดข้อมูลสถิติหน้า Dashboard
+   */
+  function loadDashboardStats(year) {
+    return new Promise((resolve) => {
+      document.getElementById('dashboardStatsGrid').innerHTML = `<div class="w-full py-10 flex justify-center text-blue-500"><i class="fa-solid fa-circle-notch fa-spin text-4xl"></i></div>`;
+      
+      // ส่ง Role ปัจจุบันเข้าไปดึงสถิติด้วย
+      google.script.run
+        .withSuccessHandler((stats) => {
+          renderDashboard(stats);
+          resolve();
+        })
+        .withFailureHandler((err) => {
+          document.getElementById('dashboardStatsGrid').innerHTML = `<div class="w-full text-center text-medical-crimson">เกิดข้อผิดพลาด: ${err}</div>`;
+          resolve();
+        })
+        .getDashboardStats(year, appState.currentRole);
+    });
+  }
+
+  /**
+   * วาดข้อมูลในหน้า Dashboard
+   */
+  function renderDashboard(stats) {
+    // 1. นับผู้ใช้รวม
+    animateValue("dashTotalCount", 0, stats.totalRespondents, 1000);
+
+    // 2. คำนวณค่าเฉลี่ยภาพรวม (Overall Stats)
+    const totalOverall = stats.overall.satisfied + stats.overall.dissatisfied;
+    let overallSatPct = 0;
+    let overallDisPct = 0;
+    if (totalOverall > 0) {
+      overallSatPct = Math.round((stats.overall.satisfied / totalOverall) * 100);
+      overallDisPct = 100 - overallSatPct;
+    }
+    
+    animateValueWithSuffix("dashOverallSatTxt", 0, overallSatPct, 1000, "%");
+    animateValueWithSuffix("dashOverallDisTxt", 0, overallDisPct, 1000, "%");
+    setTimeout(() => {
+      const overallBar = document.getElementById('dashOverallBar');
+      if(overallBar) overallBar.style.width = `${overallSatPct}%`;
+    }, 50);
+
+    // 3. วาดการ์ดรายข้อ
+    const grid = document.getElementById('dashboardStatsGrid');
+    
+    // เปลี่ยน Class จาก Grid ปกติเป็น Flex Wrap เพื่อให้การ์ดสถิติเรียงเข้ากลางด้วยเช่นกัน
+    grid.className = 'flex flex-wrap justify-center gap-4 md:gap-5 mb-8 w-full';
+    grid.innerHTML = '';
+
+    if (stats.totalRespondents === 0) {
+      grid.innerHTML = '<div class="w-full text-center text-slate-400 py-10 font-bold bg-white/50 backdrop-blur-md rounded-[2rem] border border-blue-100 shadow-sm">ยังไม่มีข้อมูลการประเมินในช่วงเวลานี้ สำหรับกลุ่มผู้รับบริการนี้</div>';
+      document.getElementById('commentsContainer').innerHTML = '<div class="text-center text-slate-400 text-sm py-4">ไม่มีข้อเสนอแนะเพิ่มเติมในช่วงเวลานี้</div>';
+      return;
+    }
+
+    const allQKeys = ['Q1', 'Q2', 'Q3', 'Q4', 'Q5'];
+    appState.questions.forEach((q) => {
+      const qKey = allQKeys[q.id - 1]; 
+      const qStats = stats.questions[qKey];
+      
+      // การดักจับกรณีเปลี่ยน Role แล้วคำถามมีน้อย/เยอะกว่าที่ถูกบันทึก (ซึ่งแก้ได้แล้วจากการจัดลำดับ Promise)
+      if (!qStats) return; 
+
+      const totalForQ = qStats.satisfied + qStats.dissatisfied;
+      
+      let satPct = 0, disPct = 0;
+      if (totalForQ > 0) {
+        satPct = Math.round((qStats.satisfied / totalForQ) * 100);
+        disPct = 100 - satPct;
+      }
+
+      const cardHtml = `
+        <div class="w-full sm:w-[calc(50%-0.5rem)] md:w-[calc(50%-0.625rem)] lg:w-[calc(20%-1rem)] max-w-[320px] flex-shrink-0 bg-white/90 backdrop-blur-md p-4 md:p-5 rounded-3xl shadow-[0_5px_15px_rgba(30,58,138,0.05)] border border-blue-50 flex flex-col justify-between hover:shadow-[0_8px_25px_rgba(30,58,138,0.1)] transition-shadow">
+          <div>
+            <div class="flex items-start gap-3 mb-3">
+              <div class="w-8 h-8 rounded-full bg-blue-50 text-medical-deepBlue flex items-center justify-center font-bold text-xs shrink-0 border border-blue-100 shadow-inner">
+                ${q.id}
+              </div>
+              <h4 class="font-bold text-slate-700 text-xs md:text-sm h-9 line-clamp-2 leading-snug">${q.text}</h4>
+            </div>
+            
+            <div class="flex justify-between items-end text-xs mb-2">
+              <div class="flex flex-col">
+                <span class="text-emerald-500 font-bold text-sm"><i class="fa-solid fa-face-smile-beam mr-1"></i>${satPct}%</span>
+              </div>
+              <div class="flex flex-col text-right">
+                <span class="text-rose-500 font-bold text-sm">${disPct}%<i class="fa-solid fa-face-frown ml-1"></i></span>
+              </div>
+            </div>
+            <div class="w-full h-2.5 bg-rose-100 rounded-full overflow-hidden flex shadow-inner">
+              <div class="h-full bg-emerald-400 transition-all duration-1000 ease-out" style="width: 0%" id="bar-${qKey}"></div>
+            </div>
+          </div>
+          <div class="mt-3 pt-2 border-t border-slate-50 text-[10px] text-slate-400 flex justify-between">
+            <span>ผู้ตอบข้อนี้</span>
+            <span class="font-bold text-medical-deepBlue">${totalForQ} คน</span>
+          </div>
+        </div>
+      `;
+      grid.insertAdjacentHTML('beforeend', cardHtml);
+      
+      setTimeout(() => {
+        const bar = document.getElementById(`bar-${qKey}`);
+        if (bar) bar.style.width = `${satPct}%`;
+      }, 100);
+    });
+
+    // 4. วาดกล่องความคิดเห็น (Comment Bubbles)
+    const commentsContainer = document.getElementById('commentsContainer');
+    commentsContainer.innerHTML = '';
+    
+    if (stats.comments && stats.comments.length > 0) {
+      stats.comments.forEach(c => {
+        const bubble = `
+          <div class="bg-white p-3 md:p-4 rounded-2xl rounded-tl-sm border border-blue-100 shadow-sm flex flex-col gap-1 hover:shadow-md transition-shadow relative">
+            <div class="absolute -left-2 top-0 w-4 h-4 bg-white border-l border-t border-blue-100 transform -skew-x-[30deg]"></div>
+            <div class="text-[10px] md:text-xs text-slate-400 font-mono flex items-center gap-1 z-10">
+              <i class="fa-regular fa-clock"></i> ${c.timestamp}
+            </div>
+            <div class="text-sm md:text-base text-slate-700 font-medium leading-relaxed z-10 break-words">
+              "${c.text}"
+            </div>
+          </div>
+        `;
+        commentsContainer.insertAdjacentHTML('beforeend', bubble);
+      });
+    } else {
+      commentsContainer.innerHTML = '<div class="text-center text-slate-400 text-sm py-4 flex flex-col items-center gap-2"><i class="fa-regular fa-folder-open text-3xl opacity-50"></i>ยังไม่มีข้อเสนอแนะเพิ่มเติมในช่วงเวลานี้</div>';
+    }
+  }
+
+  // Animation Helper สำหรับตัวเลขธรรมดา
+  function animateValue(id, start, end, duration) {
+    if (start === end) { document.getElementById(id).innerHTML = end; return; }
+    let range = end - start;
+    let current = start;
+    let increment = end > start ? 1 : -1;
+    let stepTime = Math.abs(Math.floor(duration / range));
+    if(stepTime < 10) stepTime = 10; 
+    let obj = document.getElementById(id);
+    let timer = setInterval(() => {
+      current += increment;
+      obj.innerHTML = current;
+      if (current == end) clearInterval(timer);
+    }, stepTime);
+  }
+
+  // Animation Helper สำหรับตัวเลขที่มี Suffix (เช่น %)
+  function animateValueWithSuffix(id, start, end, duration, suffix) {
+    if (start === end) { document.getElementById(id).innerHTML = end + suffix; return; }
+    let range = end - start;
+    let current = start;
+    let increment = end > start ? 1 : -1;
+    let stepTime = Math.abs(Math.floor(duration / range));
+    if(stepTime < 10) stepTime = 10; 
+    let obj = document.getElementById(id);
+    let timer = setInterval(() => {
+      current += increment;
+      obj.innerHTML = current + suffix;
+      if (current == end) clearInterval(timer);
+    }, stepTime);
+  }
+
+</script>
